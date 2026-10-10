@@ -155,6 +155,7 @@
   .tabs{
     display:flex;
     gap:8px;
+    align-items:center;
   }
   .tab{
     padding:6px 9px;
@@ -166,6 +167,13 @@
     user-select:none;
   }
   .tab.active{background:#dbe6ff;color:#173ea7;font-weight:700}
+  .panel-copy{
+    padding:6px 10px;
+    border-radius:7px;
+    background:var(--accent);
+    color:#fff;
+    font-size:11px;
+  }
   .hidden{display:none}
   .footer{
     margin-top:14px;
@@ -245,6 +253,7 @@
           <div class="tabs">
             <span class="tab active" data-view="preview">Preview</span>
             <span class="tab" data-view="html">HTML</span>
+            <button class="panel-copy" id="copyOutputBtn" type="button">Copy</button>
           </div>
         </div>
         <div id="previewEditor" class="editor" contenteditable="true"
@@ -987,6 +996,11 @@
       sel.removeAllRanges();
       toast('Rich content copied — paste into TinyMCE');
     }
+  });
+
+  document.getElementById('copyOutputBtn').addEventListener('click', () => {
+    const htmlViewOpen = !htmlOutput.classList.contains('hidden');
+    document.getElementById(htmlViewOpen ? 'copyHtmlBtn' : 'copyRichBtn').click();
   });
 
   document.getElementById('downloadBtn').addEventListener('click', () => {
