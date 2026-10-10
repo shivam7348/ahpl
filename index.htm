@@ -501,6 +501,23 @@
     container.querySelectorAll('table').forEach(table => {
       if (!table.style.borderCollapse) table.style.borderCollapse = 'collapse';
 
+      // TinyMCE themes often do not draw borders for pasted Word tables.
+      // Keep the table structure visible by giving otherwise borderless cells
+      // a transferable inline border and a little spacing.
+      table.querySelectorAll('td,th').forEach(cell => {
+        const hasBorder = [
+          cell.style.border,
+          cell.style.borderTop,
+          cell.style.borderRight,
+          cell.style.borderBottom,
+          cell.style.borderLeft
+        ].some(value => value && !/^(none|0(?:px)?)(\s|$)/i.test(value));
+
+        if (!hasBorder) cell.style.border = '1px solid #98a2b3';
+        if (!cell.style.padding) cell.style.padding = '4px 6px';
+        if (!cell.style.verticalAlign) cell.style.verticalAlign = 'top';
+      });
+
       if (fitTables.checked) {
         table.style.maxWidth = '100%';
         table.style.width = '100%';
