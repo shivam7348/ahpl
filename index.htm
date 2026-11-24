@@ -207,6 +207,9 @@
     z-index:9999;
   }
   .toast.show{opacity:1;transform:translateY(0)}
+  .ocr-progress{display:none;width:100%;height:6px;border-radius:999px;overflow:hidden;background:#e7ecf3}
+  .ocr-progress.show{display:block}
+  .ocr-progress > span{display:block;width:0;height:100%;background:var(--accent);transition:width .2s ease}
   @media (max-width:900px){
     .grid{grid-template-columns:1fr}
   }
@@ -225,7 +228,9 @@
     </div>
 
     <div class="toolbar">
-      <button class="primary" id="uploadBtn">Upload Word Document</button>
+      <button class="primary" id="imageUploadBtn">Upload Image &amp; Make Table</button>
+      <input id="imageInput" type="file" accept="image/png,image/jpeg,image/webp,image/bmp" style="display:none" />
+      <button class="secondary" id="uploadBtn">Upload Word Document</button>
       <input id="fileInput" type="file" accept=".docx,.doc,.rtf,.html,.htm,.txt" style="display:none" />
       <button class="primary" id="cleanBtn">Clean for TinyMCE</button>
       <button class="secondary" id="copyRichBtn">Copy Rich Content</button>
@@ -235,12 +240,13 @@
       <div class="spacer"></div>
       <label class="opt"><input type="checkbox" id="fitTables"> Fit tables to editor width</label>
       <label class="opt"><input type="checkbox" id="compactEmpty" checked> Remove extra empty paragraphs</label>
+      <div class="ocr-progress" id="ocrProgress" aria-label="Image extraction progress"><span></span></div>
     </div>
 
     <div class="grid">
       <section class="panel">
         <div class="panel-head">
-          <h2>1. Paste from Microsoft Word</h2>
+          <h2>1. Paste or upload Word / image</h2>
           <div class="status" id="inputStatus">Waiting for paste…</div>
         </div>
         <div id="inputEditor" class="editor" contenteditable="true"
@@ -898,6 +904,101 @@
       .trim();
   }
 
+  function loadOcrEngine(){
+    if (window.Tesseract) return Promise.resolve(window.Tesseract);
+    return new Promise((resolve, reject) => {
+      const existing = document.querySelector('script[data-ocr-engine]');
+      if (existing) {
+        existing.addEventListener('load', () => resolve(window.Tesseract), {once:true});
+        existing.addEventListener('error', () => reject(new Error('OCR library load nahi hui. Internet connection check karein.')), {once:true});
+        return;
+      }
+      const script = document.createElement('script');
+      script.dataset.ocrEngine = 'true';
+      script.src = 'https://cdn.jsdelivr.net/npm/tesseract.js@5/dist/tesseract.min.js';
+      script.onload = () => resolve(window.Tesseract);
+      script.onerror = () => reject(new Error('OCR library load nahi hui. Internet connection check karein.'));
+      document.head.appendChild(script);
+    });
+  }
+
+  function rowsToTable(rows){
+    rows = rows.filter(r => r.length);
+    if (!rows.length) return '';
+    const maxCols = Math.max(...rows.map(r => r.length));
+    const body = rows.map((row, i) => {
+      const tag = i === 0 && rows.length > 1 ? 'th' : 'td';
+      return '<tr>' + row.concat(Array(maxCols-row.length).fill('')).map(c => `<${tag}>${esc(c)}</${tag}>`).join('') + '</tr>';
+    }).join('');
+    return '<table border="1" cellspacing="0" cellpadding="6" style="border-collapse:collapse;width:100%"><tbody>' + body + '</tbody></table>';
+  }
+
+  function textToTable(text){
+    const rows = String(text || '').split(/\r?\n/).map(line =>
+      line.trim().split(/\t+|\s{2,}|\s*[|]\s*/).map(s => s.trim()).filter(Boolean)
+    ).filter(r => r.length);
+    return rowsToTable(rows);
+  }
+
+  function tsvToTable(tsv, fallbackText){
+    if (!tsv) return textToTable(fallbackText);
+    const grouped = new Map();
+    for (const line of tsv.split(/\r?\n/).slice(1)) {
+      const p = line.split('\t');
+      if (p.length < 12 || p[0] !== '5' || !p.slice(11).join('\t').trim()) continue;
+      const key = p.slice(1, 5).join('-');
+      if (!grouped.has(key)) grouped.set(key, []);
+      grouped.get(key).push({x:+p[6], w:+p[8], h:+p[9], text:p.slice(11).join('\t').trim()});
+    }
+    if (!grouped.size) return textToTable(fallbackText);
+    const rows = [...grouped.values()].map(words => {
+      words.sort((a,b) => a.x-b.x);
+      const avgH = words.reduce((sum,w) => sum+w.h, 0) / words.length;
+      const cells = [];
+      let current = '', right = null;
+      for (const word of words) {
+        const gap = right == null ? 0 : word.x-right;
+        if (current && gap > Math.max(22, avgH*1.35)) { cells.push(current); current=word.text; }
+        else current += (current ? ' ' : '') + word.text;
+        right = word.x+word.w;
+      }
+      if (current) cells.push(current);
+      return cells;
+    });
+    return rowsToTable(rows) || textToTable(fallbackText);
+  }
+
+  async function extractImageAsTable(file, name){
+    const progress = document.getElementById('ocrProgress');
+    const bar = progress.querySelector('span');
+    progress.classList.add('show');
+    bar.style.width = '2%';
+    const Tesseract = await loadOcrEngine();
+    const logger = message => {
+      const pct = Math.round((message.progress || 0)*100);
+      bar.style.width = pct + '%';
+      if (message.status) inputStatus.textContent = `${message.status} ${pct ? pct+'%' : ''}`;
+    };
+    let worker;
+    let result;
+    try {
+      worker = await Tesseract.createWorker('eng', Tesseract.OEM.LSTM_ONLY, {logger});
+      // TSV is requested explicitly because recent Tesseract.js versions return
+      // only plain text by default. TSV gives every word's x/y position, which
+      // is required to rebuild rows and columns from the uploaded image.
+      result = await worker.recognize(file, {}, {text:true, tsv:true});
+    } finally {
+      if (worker) await worker.terminate();
+    }
+    const html = tsvToTable(result && result.data.tsv, result && result.data.text);
+    if (!html) throw new Error('Image mein readable text nahi mila. Clear aur seedhi image try karein.');
+    inputEditor.innerHTML = html;
+    inputStatus.textContent = name + ' extracted into table';
+    bar.style.width = '100%';
+    setTimeout(() => progress.classList.remove('show'), 700);
+    return html;
+  }
+
   async function handleUploadedFile(file){
     if (!file) return;
     const name = file.name || 'document';
@@ -911,7 +1012,10 @@
       let sourceHtml = '';
       let sourceText = '';
 
-      if (ext === 'docx') {
+      if (file.type.startsWith('image/') || ['png','jpg','jpeg','webp','bmp'].includes(ext)) {
+        sourceHtml = await extractImageAsTable(file, name);
+        sourceText = inputEditor.innerText;
+      } else if (ext === 'docx') {
         const ab = await file.arrayBuffer();
         const entries = await readZipEntries(ab, new Set(['word/document.xml']));
         if (!entries['word/document.xml']) throw new Error('word/document.xml not found inside DOCX.');
@@ -947,7 +1051,7 @@
 
       const result = cleanWordHtml(lastRawHtml, lastPlainText);
       setResult(result.html, result.stats);
-      toast('Document loaded and converted for TinyMCE');
+      toast(file.type.startsWith('image/') ? 'Image extracted into editable table' : 'Document loaded and converted for TinyMCE');
 
     } catch (err) {
       console.error(err);
@@ -957,6 +1061,7 @@
       detailText.textContent = ' · ' + err.message;
       alert(err.message);
     } finally {
+      document.getElementById('ocrProgress').classList.remove('show');
       document.getElementById('fileInput').value = '';
     }
   }
@@ -965,8 +1070,17 @@
     document.getElementById('fileInput').click();
   });
 
+  document.getElementById('imageUploadBtn').addEventListener('click', () => {
+    document.getElementById('imageInput').click();
+  });
+
   document.getElementById('fileInput').addEventListener('change', (e) => {
     handleUploadedFile(e.target.files && e.target.files[0]);
+  });
+
+  document.getElementById('imageInput').addEventListener('change', (e) => {
+    handleUploadedFile(e.target.files && e.target.files[0]);
+    e.target.value = '';
   });
 
   document.getElementById('cleanBtn').addEventListener('click', cleanNow);
@@ -1023,7 +1137,10 @@
   document.getElementById('downloadBtn').addEventListener('click', () => {
     const html = htmlOutput.value || previewEditor.innerHTML;
     if (!html.trim()) return toast('Nothing to download');
-    const full = `<!doctype html><html><head><meta charset="utf-8"><title>TinyMCE Content</title></head><body>${html}</body></html>`;
+    // Keep closing tags split so development servers do not inject their
+    // reload script into this JavaScript string instead of the real page end.
+    const full = '<!doctype html><html><head><meta charset="utf-8"><title>TinyMCE Content</title></head><body>' +
+      html + '<' + '/body><' + '/html>';
     const blob = new Blob([full], {type:'text/html;charset=utf-8'});
     const a = document.createElement('a');
     a.href = URL.createObjectURL(blob);
