@@ -105,6 +105,7 @@
     overflow:hidden;
     min-height:520px;
   }
+  .panel.full-width{grid-column:1/-1;min-height:280px}
   .panel-head{
     padding:12px 14px;
     border-bottom:1px solid var(--border);
@@ -151,6 +152,21 @@
     line-height:1.45;
     color:#1f2937;
     background:#fbfcff;
+  }
+  .exact-text{
+    width:100%;
+    min-height:220px;
+    resize:vertical;
+    border:0;
+    outline:none;
+    padding:18px;
+    font-family:Arial,sans-serif;
+    font-size:14px;
+    line-height:1.55;
+    white-space:pre-wrap;
+    tab-size:4;
+    color:#1f2937;
+    background:#fff;
   }
   .tabs{
     display:flex;
@@ -223,7 +239,7 @@
 
   <div class="wrap">
     <div class="notice">
-      Best workflow: <b>Upload .DOCX or copy from Word → clean → Copy Rich Content → paste in FLABS TinyMCE.</b>
+      Best workflow: <b>Upload a document/image, or copy a screenshot/image and press Ctrl+V anywhere on this page.</b>
       Tables, bold/italic/underline, alignment, font size, colors, lists, superscript/subscript and most borders are preserved.
     </div>
 
@@ -250,7 +266,7 @@
           <div class="status" id="inputStatus">Waiting for paste…</div>
         </div>
         <div id="inputEditor" class="editor" contenteditable="true"
-             data-placeholder="Click here and paste directly from Word (Ctrl+V)…"></div>
+             data-placeholder="Paste Word content or a copied screenshot/image here (Ctrl+V). Images become editable tables."></div>
       </section>
 
       <section class="panel">
@@ -265,6 +281,15 @@
         <div id="previewEditor" class="editor" contenteditable="true"
              data-placeholder="Clean result will appear here…"></div>
         <textarea id="htmlOutput" class="htmlbox hidden" spellcheck="false"></textarea>
+      </section>
+
+      <section class="panel full-width">
+        <div class="panel-head">
+          <h2>3. Exact extracted text (bullets, numbering &amp; line breaks)</h2>
+          <button class="panel-copy" id="copyExactTextBtn" type="button">Copy Text</button>
+        </div>
+        <textarea id="exactTextOutput" class="exact-text" spellcheck="false"
+          placeholder="Exact text extracted from the uploaded/pasted image will appear here separately."></textarea>
       </section>
     </div>
 
@@ -281,6 +306,7 @@
   const inputEditor = document.getElementById('inputEditor');
   const previewEditor = document.getElementById('previewEditor');
   const htmlOutput = document.getElementById('htmlOutput');
+  const exactTextOutput = document.getElementById('exactTextOutput');
   const inputStatus = document.getElementById('inputStatus');
   const resultBadge = document.getElementById('resultBadge');
   const detailText = document.getElementById('detailText');
@@ -619,7 +645,29 @@
     toast('TinyMCE-ready content created');
   }
 
-  inputEditor.addEventListener('paste', (e) => {
+  function getClipboardImage(dataTransfer){
+    if (!dataTransfer) return null;
+    const item = [...(dataTransfer.items || [])].find(entry =>
+      entry.kind === 'file' && entry.type && entry.type.startsWith('image/')
+    );
+    if (item) return item.getAsFile();
+    return [...(dataTransfer.files || [])].find(file => file.type.startsWith('image/')) || null;
+  }
+
+  async function processClipboardImage(e){
+    const dt = e.clipboardData || window.clipboardData;
+    const image = getClipboardImage(dt);
+    if (!image) return false;
+    e.preventDefault();
+    const extension = (image.type.split('/')[1] || 'png').replace('jpeg','jpg');
+    const file = new File([image], `clipboard-image-${Date.now()}.${extension}`, {type:image.type});
+    inputStatus.textContent = 'Clipboard image received...';
+    await handleUploadedFile(file);
+    return true;
+  }
+
+  inputEditor.addEventListener('paste', async (e) => {
+    if (await processClipboardImage(e)) return;
     e.preventDefault();
     const dt = e.clipboardData || window.clipboardData;
     const html = dt.getData('text/html');
@@ -627,6 +675,7 @@
 
     lastRawHtml = html;
     lastPlainText = text;
+    exactTextOutput.value = text || '';
 
     // Show the original pasted content on the left (browser-rendered).
     if (html) {
@@ -640,6 +689,13 @@
     const result = cleanWordHtml(html, text);
     setResult(result.html, result.stats);
     toast('Word paste captured and cleaned');
+  });
+
+  // Catch copied screenshots/images even when the editor is not focused.
+  // Normal text paste outside the editor is intentionally left untouched.
+  document.addEventListener('paste', async (e) => {
+    if (e.defaultPrevented || inputEditor.contains(e.target)) return;
+    await processClipboardImage(e);
   });
 
   inputEditor.addEventListener('input', () => {
@@ -1164,7 +1220,7 @@
     imageButton.disabled = false;
     imageButton.textContent = 'Upload Image & Make Table';
     setTimeout(() => progress.classList.remove('show'), 700);
-    return html;
+    return {html, text:(result && result.data.text ? result.data.text : '').trimEnd()};
   }
 
   async function handleUploadedFile(file){
@@ -1181,8 +1237,10 @@
       let sourceText = '';
 
       if (file.type.startsWith('image/') || ['png','jpg','jpeg','webp','bmp'].includes(ext)) {
-        sourceHtml = await extractImageAsTable(file, name);
-        sourceText = inputEditor.innerText;
+        const extracted = await extractImageAsTable(file, name);
+        sourceHtml = extracted.html;
+        sourceText = extracted.text;
+        exactTextOutput.value = sourceText;
       } else if (ext === 'docx') {
         const ab = await file.arrayBuffer();
         const entries = await readZipEntries(ab, new Set(['word/document.xml']));
@@ -1216,6 +1274,7 @@
 
       lastRawHtml = sourceHtml || inputEditor.innerHTML;
       lastPlainText = sourceText || inputEditor.innerText;
+      if (!file.type.startsWith('image/')) exactTextOutput.value = lastPlainText;
 
       const result = cleanWordHtml(lastRawHtml, lastPlainText);
       setResult(result.html, result.stats);
@@ -1305,6 +1364,20 @@
     document.getElementById(htmlViewOpen ? 'copyHtmlBtn' : 'copyRichBtn').click();
   });
 
+  document.getElementById('copyExactTextBtn').addEventListener('click', async () => {
+    const text = exactTextOutput.value;
+    if (!text.trim()) return toast('No extracted text to copy');
+    try {
+      await navigator.clipboard.writeText(text);
+      toast('Exact text copied');
+    } catch {
+      exactTextOutput.focus();
+      exactTextOutput.select();
+      document.execCommand('copy');
+      toast('Exact text copied');
+    }
+  });
+
   document.getElementById('downloadBtn').addEventListener('click', () => {
     const html = htmlOutput.value || previewEditor.innerHTML;
     if (!html.trim()) return toast('Nothing to download');
@@ -1325,6 +1398,7 @@
     inputEditor.innerHTML = '';
     previewEditor.innerHTML = '';
     htmlOutput.value = '';
+    exactTextOutput.value = '';
     lastRawHtml = '';
     lastPlainText = '';
     inputStatus.textContent = 'Waiting for paste…';
