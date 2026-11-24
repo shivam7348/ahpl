@@ -940,7 +940,7 @@
     return rowsToTable(rows);
   }
 
-  function tsvToTable(tsv, fallbackText){
+  function tsvToTable(tsv, fallbackText, columnLines=[]){
     if (!tsv) return textToTable(fallbackText);
     const grouped = new Map();
     for (const line of tsv.split(/\r?\n/).slice(1)) {
@@ -951,8 +951,24 @@
       grouped.get(key).push({x:+p[6], w:+p[8], h:+p[9], text:p.slice(11).join('\t').trim()});
     }
     if (!grouped.size) return textToTable(fallbackText);
+    const usableColumns = columnLines.length >= 2 ? columnLines : [];
     const rows = [...grouped.values()].map(words => {
       words.sort((a,b) => a.x-b.x);
+      if (usableColumns.length) {
+        const cells = Array(usableColumns.length-1).fill('');
+        for (const word of words) {
+          const center = word.x + word.w/2;
+          let column = usableColumns.length-2;
+          if (center < usableColumns[0]) column = 0;
+          else {
+            for (let i=0; i<usableColumns.length-1; i++) {
+              if (center >= usableColumns[i] && center < usableColumns[i+1]) { column=i; break; }
+            }
+          }
+          cells[column] += (cells[column] ? ' ' : '') + word.text;
+        }
+        return cells;
+      }
       const avgH = words.reduce((sum,w) => sum+w.h, 0) / words.length;
       const cells = [];
       let current = '', right = null;
@@ -966,6 +982,77 @@
       return cells;
     });
     return rowsToTable(rows) || textToTable(fallbackText);
+  }
+
+  function removeTableGridLines(canvas, ctx){
+    const width = canvas.width;
+    const height = canvas.height;
+    const pixels = ctx.getImageData(0, 0, width, height);
+    const data = pixels.data;
+    const dark = (x, y) => {
+      const i = (y*width+x)*4;
+      return (data[i]*0.299 + data[i+1]*0.587 + data[i+2]*0.114) < 145;
+    };
+    const horizontal = new Set();
+    const vertical = new Set();
+
+    // Table borders form unusually long, uninterrupted dark runs. Text strokes
+    // are much shorter, so this removes grid lines without erasing the words.
+    for (let y=0; y<height; y++) {
+      let run=0, longest=0;
+      for (let x=0; x<width; x++) {
+        run = dark(x,y) ? run+1 : 0;
+        if (run>longest) longest=run;
+      }
+      if (longest > width*0.22) horizontal.add(y);
+    }
+    for (let x=0; x<width; x++) {
+      let run=0, longest=0;
+      for (let y=0; y<height; y++) {
+        run = dark(x,y) ? run+1 : 0;
+        if (run>longest) longest=run;
+      }
+      if (longest > height*0.20) vertical.add(x);
+    }
+
+    const centers = values => {
+      const sorted = [...values].sort((a,b) => a-b);
+      const groups = [];
+      for (const value of sorted) {
+        const group = groups[groups.length-1];
+        if (!group || value-group[group.length-1] > 3) groups.push([value]);
+        else group.push(value);
+      }
+      return groups.map(group => Math.round(group.reduce((a,b)=>a+b,0)/group.length));
+    };
+    const verticalPositions = centers(vertical);
+    const horizontalPositions = centers(horizontal);
+    if (!horizontal.size && !vertical.size) {
+      return {horizontal:0, vertical:0, horizontalPositions:[], verticalPositions:[]};
+    }
+    const expandedRows = new Set();
+    const expandedCols = new Set();
+    horizontal.forEach(y => { for (let d=-2; d<=2; d++) if (y+d>=0 && y+d<height) expandedRows.add(y+d); });
+    vertical.forEach(x => { for (let d=-2; d<=2; d++) if (x+d>=0 && x+d<width) expandedCols.add(x+d); });
+    for (const y of expandedRows) {
+      for (let x=0; x<width; x++) {
+        const i=(y*width+x)*4;
+        data[i]=data[i+1]=data[i+2]=255; data[i+3]=255;
+      }
+    }
+    for (const x of expandedCols) {
+      for (let y=0; y<height; y++) {
+        const i=(y*width+x)*4;
+        data[i]=data[i+1]=data[i+2]=255; data[i+3]=255;
+      }
+    }
+    ctx.putImageData(pixels, 0, 0);
+    return {
+      horizontal:horizontalPositions.length,
+      vertical:verticalPositions.length,
+      horizontalPositions,
+      verticalPositions
+    };
   }
 
   async function prepareImageForOcr(file){
@@ -994,7 +1081,10 @@
       const maxHeight = 6000;
       const maxPixels = 12000000;
       const pixelScale = Math.sqrt(maxPixels / (sourceWidth * sourceHeight));
-      const scale = Math.min(1, maxWidth/sourceWidth, maxHeight/sourceHeight, pixelScale);
+      // Small screenshots often contain 10-14px text. Upscale them so the OCR
+      // engine receives roughly 24-30px characters instead of guessing shapes.
+      const desiredScale = Math.min(2.5, Math.max(1, 2200/sourceWidth));
+      const scale = Math.min(desiredScale, maxWidth/sourceWidth, maxHeight/sourceHeight, pixelScale);
       const width = Math.max(1, Math.round(sourceWidth * scale));
       const height = Math.max(1, Math.round(sourceHeight * scale));
 
@@ -1009,12 +1099,19 @@
       ctx.imageSmoothingQuality = 'high';
       ctx.filter = 'contrast(1.12)';
       ctx.drawImage(image, 0, 0, width, height);
+      ctx.filter = 'none';
+      const removedLines = removeTableGridLines(canvas, ctx);
 
       const blob = await new Promise((resolve, reject) => canvas.toBlob(
         value => value ? resolve(value) : reject(new Error('Optimized image create nahi ho saki.')),
         'image/png'
       ));
-      return {blob, sourceWidth, sourceHeight, width, height, resized:scale < 0.999};
+      return {
+        blob, sourceWidth, sourceHeight, width, height,
+        resized:Math.abs(scale-1) > 0.001,
+        upscaled:scale > 1.001,
+        removedLines
+      };
     } finally {
       if (image && typeof image.close === 'function') image.close();
       if (revokeUrl) URL.revokeObjectURL(revokeUrl);
@@ -1032,7 +1129,7 @@
     inputStatus.textContent = 'Optimizing image...';
     const prepared = await prepareImageForOcr(file);
     if (prepared.resized) {
-      inputStatus.textContent = `Large image optimized (${prepared.width} × ${prepared.height})`;
+      inputStatus.textContent = `${prepared.upscaled ? 'Text enlarged' : 'Large image optimized'} (${prepared.width} × ${prepared.height})`;
     }
     const Tesseract = await loadOcrEngine();
     const logger = message => {
@@ -1049,12 +1146,17 @@
       // is required to rebuild rows and columns from the uploaded image.
       result = await worker.recognize(prepared.blob, {
         preserve_interword_spaces:'1',
-        user_defined_dpi:'300'
+        user_defined_dpi:'300',
+        tessedit_pageseg_mode:'6'
       }, {text:true, tsv:true});
     } finally {
       if (worker) await worker.terminate();
     }
-    const html = tsvToTable(result && result.data.tsv, result && result.data.text);
+    const html = tsvToTable(
+      result && result.data.tsv,
+      result && result.data.text,
+      prepared.removedLines.verticalPositions
+    );
     if (!html) throw new Error('Image mein readable text nahi mila. Clear aur seedhi image try karein.');
     inputEditor.innerHTML = html;
     inputStatus.textContent = name + ' extracted into table';
