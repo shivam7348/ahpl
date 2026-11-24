@@ -968,11 +968,72 @@
     return rowsToTable(rows) || textToTable(fallbackText);
   }
 
+  async function prepareImageForOcr(file){
+    let image;
+    let revokeUrl = '';
+    try {
+      if ('createImageBitmap' in window) {
+        image = await createImageBitmap(file, {imageOrientation:'from-image'});
+      } else {
+        revokeUrl = URL.createObjectURL(file);
+        image = await new Promise((resolve, reject) => {
+          const img = new Image();
+          img.onload = () => resolve(img);
+          img.onerror = () => reject(new Error('Image browser mein open nahi ho saki.'));
+          img.src = revokeUrl;
+        });
+      }
+
+      const sourceWidth = image.width || image.naturalWidth;
+      const sourceHeight = image.height || image.naturalHeight;
+      if (!sourceWidth || !sourceHeight) throw new Error('Image dimensions read nahi ho sakin.');
+
+      // Large phone photos can exceed the browser/OCR memory limit. Preserve
+      // enough detail for text while keeping the working canvas under 12 MP.
+      const maxWidth = 2600;
+      const maxHeight = 6000;
+      const maxPixels = 12000000;
+      const pixelScale = Math.sqrt(maxPixels / (sourceWidth * sourceHeight));
+      const scale = Math.min(1, maxWidth/sourceWidth, maxHeight/sourceHeight, pixelScale);
+      const width = Math.max(1, Math.round(sourceWidth * scale));
+      const height = Math.max(1, Math.round(sourceHeight * scale));
+
+      const canvas = document.createElement('canvas');
+      canvas.width = width;
+      canvas.height = height;
+      const ctx = canvas.getContext('2d', {alpha:false});
+      if (!ctx) throw new Error('Image processing canvas available nahi hai.');
+      ctx.fillStyle = '#fff';
+      ctx.fillRect(0, 0, width, height);
+      ctx.imageSmoothingEnabled = true;
+      ctx.imageSmoothingQuality = 'high';
+      ctx.filter = 'contrast(1.12)';
+      ctx.drawImage(image, 0, 0, width, height);
+
+      const blob = await new Promise((resolve, reject) => canvas.toBlob(
+        value => value ? resolve(value) : reject(new Error('Optimized image create nahi ho saki.')),
+        'image/png'
+      ));
+      return {blob, sourceWidth, sourceHeight, width, height, resized:scale < 0.999};
+    } finally {
+      if (image && typeof image.close === 'function') image.close();
+      if (revokeUrl) URL.revokeObjectURL(revokeUrl);
+    }
+  }
+
   async function extractImageAsTable(file, name){
     const progress = document.getElementById('ocrProgress');
     const bar = progress.querySelector('span');
+    const imageButton = document.getElementById('imageUploadBtn');
+    imageButton.disabled = true;
+    imageButton.textContent = 'Processing image...';
     progress.classList.add('show');
     bar.style.width = '2%';
+    inputStatus.textContent = 'Optimizing image...';
+    const prepared = await prepareImageForOcr(file);
+    if (prepared.resized) {
+      inputStatus.textContent = `Large image optimized (${prepared.width} × ${prepared.height})`;
+    }
     const Tesseract = await loadOcrEngine();
     const logger = message => {
       const pct = Math.round((message.progress || 0)*100);
@@ -986,7 +1047,10 @@
       // TSV is requested explicitly because recent Tesseract.js versions return
       // only plain text by default. TSV gives every word's x/y position, which
       // is required to rebuild rows and columns from the uploaded image.
-      result = await worker.recognize(file, {}, {text:true, tsv:true});
+      result = await worker.recognize(prepared.blob, {
+        preserve_interword_spaces:'1',
+        user_defined_dpi:'300'
+      }, {text:true, tsv:true});
     } finally {
       if (worker) await worker.terminate();
     }
@@ -995,6 +1059,8 @@
     inputEditor.innerHTML = html;
     inputStatus.textContent = name + ' extracted into table';
     bar.style.width = '100%';
+    imageButton.disabled = false;
+    imageButton.textContent = 'Upload Image & Make Table';
     setTimeout(() => progress.classList.remove('show'), 700);
     return html;
   }
@@ -1062,6 +1128,9 @@
       alert(err.message);
     } finally {
       document.getElementById('ocrProgress').classList.remove('show');
+      const imageButton = document.getElementById('imageUploadBtn');
+      imageButton.disabled = false;
+      imageButton.textContent = 'Upload Image & Make Table';
       document.getElementById('fileInput').value = '';
     }
   }
